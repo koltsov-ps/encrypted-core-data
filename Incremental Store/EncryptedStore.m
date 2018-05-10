@@ -822,7 +822,7 @@ static const NSInteger kTableCheckVersion = 1;
     }
     //sqlite3_bind_int64(statement, 1, primaryKey);
 
-    if (sqlite3_step(statement) == SQLITE_ROW) {
+    while (sqlite3_step(statement) == SQLITE_ROW) {
         NSMutableDictionary *dictionary = [NSMutableDictionary dictionary];
         NSMutableArray * allProperties = [NSMutableArray new];
 
@@ -846,7 +846,6 @@ static const NSInteger kTableCheckVersion = 1;
         unsigned long long primaryKey = (unsigned long long) sqlite3_column_int64(statement, columns.count - 1);
         NSManagedObjectID *objectID = primaryKeyToObjectID[@(primaryKey)];
 
-        sqlite3_finalize(statement);
         NSIncrementalStoreNode *node = [[CMDIncrementalStoreNode alloc]
                 initWithObjectID:objectID
                       withValues:dictionary
@@ -855,9 +854,8 @@ static const NSInteger kTableCheckVersion = 1;
         [nodeCache setObject:node forKey:objectID];
         [result addObject:node];
     }
-    else {
+    if (statement == NULL || sqlite3_finalize(statement) != SQLITE_OK) {
         if (error) { *error = [self databaseError]; }
-        sqlite3_finalize(statement);
         return nil;
     }
     return result;
