@@ -8,10 +8,15 @@
 #error This class requires ARC.
 #endif
 
-#import "sqlite3.h"
+#import <sqlite3.h>
 #import <objc/runtime.h>
 
 #import "EncryptedStore.h"
+
+#if defined(SQLITE_HAS_CODEC)
+SQLITE_API int sqlite3_key(sqlite3 *db, const void *pKey, int nKey);
+SQLITE_API int sqlite3_rekey(sqlite3 *db, const void *pKey, int nKey);
+#endif
 
 typedef sqlite3_stmt sqlite3_statement;
 
@@ -520,6 +525,19 @@ static const NSInteger kTableCheckVersion = 1;
                 if (error) { *error = [self databaseError]; }
                 return nil;
             }
+
+            //NOTE: OPTIMIZATION for single entity
+            if (![self entityNeedsEntityTypeColumn:entity]) {
+                if (type == NSManagedObjectIDResultType) {
+                    [self nodesForObjectIDs:results withContext:context error:error];
+                } else {
+                    NSMutableArray *objectIDs = [[NSMutableArray alloc] initWithCapacity: results.count];
+                    for (NSManagedObject *obj in results) {
+                        [objectIDs addObject:obj.objectID];
+                    }
+                    [self nodesForObjectIDs:objectIDs withContext:context error:error];
+                }
+            }
         }
         
         // return fetched dictionaries
@@ -696,7 +714,153 @@ static const NSInteger kTableCheckVersion = 1;
         sqlite3_finalize(statement);
         return nil;
     }
+}
+
+//NOTE: objects must be of same entity
+//NOTE: result order don't match objectIDs order
+- (NSArray *)nodesForObjectIDs:(NSArray *)objectIDs
+       withContext:(NSManagedObjectContext *)context
+             error:(NSError **)error {
+
+    if (objectIDs.count == 0) {
+        return [NSArray new];
+    }
+
+    NSEntityDescription *entity = ((NSManagedObjectID *)objectIDs.firstObject).entity;
+    NSMutableArray *result = [[NSMutableArray alloc] initWithCapacity:objectIDs.count];
+    NSMutableDictionary *primaryKeyToObjectID = [[NSMutableDictionary alloc] initWithCapacity:objectIDs.count];
+    for (NSManagedObjectID *objectID in objectIDs) {
+        // cache hit
+        {
+            NSIncrementalStoreNode *node = [nodeCache objectForKey:objectID];
+            if (node) {
+                [result addObject:node];
+                continue;
+            }
+        }
+
+        NSEntityDescription *objectEntity = [objectID entity];
+        if (objectEntity != entity) {
+            NSAssert(objectEntity != entity, @"Object's type must be the same");
+        }
+
+        unsigned long long primaryKey = [[self referenceObjectForObjectID:objectID] unsignedLongLongValue];
+        primaryKeyToObjectID[@(primaryKey)] = objectID;
+    }
+
+    NSMutableArray *columns = [NSMutableArray array];
+    NSMutableArray *keys = [NSMutableArray array];
+    NSMutableArray *typeJoins = [NSMutableArray array];
+    NSMutableSet *entityTypes = [NSMutableSet set];
+    NSString *table = [self tableNameForEntity:entity];
+
+    // enumerate properties
+    NSDictionary *properties = [entity propertiesByName];
+    __block NSUInteger tableAliasIndex = 0;
+    [properties enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSPropertyDescription *obj, BOOL *stop) {
+        if (obj.transient) return;
+        if ([obj isKindOfClass:[NSAttributeDescription class]]) {
+            [columns addObject:[NSString stringWithFormat:@"%@.%@", table, key]];
+            [keys addObject:key];
+        }
+        else if ([obj isKindOfClass:[NSRelationshipDescription class]]) {
+            NSRelationshipDescription *relationship = (NSRelationshipDescription *) obj;
+            NSEntityDescription *destinationEntity = relationship.destinationEntity;
+
+
+            // Handle many-to-one and one-to-one
+            if (![relationship isToMany]) {
+                NSString *column = [self foreignKeyColumnForRelationship:relationship];
+                [columns addObject:[NSString stringWithFormat:@"%@.%@", table, column]];
+                [keys addObject:key];
+
+                // We need to fetch the direct entity not its super type
+                if ([self entityNeedsEntityTypeColumn:destinationEntity]) {
+                    // Get the destination table for the type look up
+                    NSString *destinationTable = [self tableNameForEntity:destinationEntity];
+                    NSString *destinationAlias = [NSString stringWithFormat:@"t%lu", (unsigned long)tableAliasIndex];
+                    tableAliasIndex++;
+
+                    // Add teh type column to the query
+                    NSString *typeColumn = [NSString stringWithFormat:@"%@.__entityType", destinationAlias];
+                    [columns addObject:typeColumn];
+
+                    // Use LEFT JOIN as a relationship can be optional
+                    NSString *join = [NSString stringWithFormat:@" LEFT JOIN %@ as %@ ON %@.__objectid=%@.%@", destinationTable, destinationAlias, destinationAlias, table, column];
+
+                    [typeJoins addObject:join];
+
+                    // Mark that this relation needs a type lookup
+                    [entityTypes addObject:key];
+                }
+            }
+
+        }
+    }];
     
+    NSMutableString* paramsMask = [NSMutableString new];
+    for (int i=0; i<primaryKeyToObjectID.count; i++) {
+        if (i != 0) {
+            [paramsMask appendString:@","];
+        }
+        [paramsMask appendString:@"?"];
+    }
+
+    NSString* objectIdColumn = [NSString stringWithFormat:@"%@.__objectid", table];
+    [columns addObject:objectIdColumn];
+    // prepare query
+    NSString *string = [NSString stringWithFormat:
+            @"SELECT %@ FROM %@%@ WHERE %@.__objectid IN (%@);",
+            [columns componentsJoinedByString:@", "],
+            table, [typeJoins componentsJoinedByString:@""], table, paramsMask];
+    sqlite3_stmt *statement = [self preparedStatementForQuery:string];
+
+    // run query
+    NSArray* primaryKeys = primaryKeyToObjectID.allKeys;
+    for (NSUInteger i=0; i<primaryKeys.count; i++) {
+        sqlite3_bind_int64(statement, i+1, ((NSNumber *)primaryKeys[i]).unsignedLongLongValue);
+    }
+    //sqlite3_bind_int64(statement, 1, primaryKey);
+
+    if (sqlite3_step(statement) == SQLITE_ROW) {
+        NSMutableDictionary *dictionary = [NSMutableDictionary dictionary];
+        NSMutableArray * allProperties = [NSMutableArray new];
+
+        __block int offset = 0;
+
+        [keys enumerateObjectsUsingBlock:^(id obj, NSUInteger idx, BOOL *stop) {
+            NSPropertyDescription *property = [properties objectForKey:obj];
+            id value = [self valueForProperty:property inStatement:statement atIndex:(int)idx + offset withEntity:entity];
+
+            if ([entityTypes containsObject:obj]) {
+                // This key needs an entity type - the next column will be it, so shift all values from now on
+                offset++;
+            }
+
+            if (value) {
+                [dictionary setObject:value forKey:obj];
+            }
+            [allProperties addObject:property];
+        }];
+
+        unsigned long long primaryKey = (unsigned long long) sqlite3_column_int64(statement, columns.count - 1);
+        NSManagedObjectID *objectID = primaryKeyToObjectID[@(primaryKey)];
+
+        sqlite3_finalize(statement);
+        NSIncrementalStoreNode *node = [[CMDIncrementalStoreNode alloc]
+                initWithObjectID:objectID
+                      withValues:dictionary
+                         version:1
+                  withProperties:allProperties];
+        [nodeCache setObject:node forKey:objectID];
+        [result addObject:node];
+    }
+    else {
+        if (error) { *error = [self databaseError]; }
+        sqlite3_finalize(statement);
+        return nil;
+    }
+    return result;
 }
 
 - (id)newValueForRelationship:(NSRelationshipDescription *)relationship
